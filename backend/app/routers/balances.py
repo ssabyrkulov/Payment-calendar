@@ -125,6 +125,20 @@ def import_cash_balances_workbook(
     return {"added": len(parsed), "snapshot": True}
 
 
+def _shrink_note(db: Session, org: str, new_count: int) -> str:
+    """Пометка в журнал, если снимок остатков резко похудел.
+
+    Снимок — факт 1С, спорить с ним портал не вправе, поэтому загружаем в
+    любом случае. Но обрезанная выгрузка выглядит точно так же, как реально
+    опустевший склад, и молчать об этом нельзя: в журнале должно остаться
+    прямое указание, что позиций стало кратно меньше."""
+    have = (db.query(models.StockBalance)
+            .filter(models.StockBalance.organization == org).count())
+    if have >= 20 and new_count < have * 0.5:
+        return f", резкое сокращение: было {have} строк, стало {new_count}"
+    return ""
+
+
 def _import_stock_matrix(db: Session, rows, header_idx: int,
                          filename: str, user_id: int, org: str) -> dict:
     """Матричный отчёт остатков: номенклатура × склады.
@@ -192,6 +206,7 @@ def _import_stock_matrix(db: Session, rows, header_idx: int,
         return {"added": 0, "snapshot": True, "empty": True,
                 "detail": "В файле нет строк остатков — прежние данные сохранены."}
 
+    note = _shrink_note(db, org, len(parsed))
     db.query(models.StockBalance).filter(
         models.StockBalance.organization == org).delete(synchronize_session=False)
     now = datetime.utcnow()
@@ -199,7 +214,7 @@ def _import_stock_matrix(db: Session, rows, header_idx: int,
         p.updated_at = now
         db.add(p)
     db.add(models.ImportLog(
-        filename=f"[остатки товаров] {filename}", user_id=user_id,
+        filename=f"[остатки товаров{note}] {filename}", user_id=user_id,
         added=len(parsed), skipped=0, errors_count=0,
     ))
     db.commit()
@@ -250,6 +265,7 @@ def _import_stock_flat(db: Session, data_rows, header_cells: dict,
                 "detail": "В файле нет строк остатков — прежние данные сохранены."}
 
     # Снимок: замена целиком в рамках организации (как у иерархического).
+    note = _shrink_note(db, org, len(parsed))
     db.query(models.StockBalance).filter(
         models.StockBalance.organization == org).delete(synchronize_session=False)
     now = datetime.utcnow()
@@ -257,7 +273,7 @@ def _import_stock_flat(db: Session, data_rows, header_cells: dict,
         p.updated_at = now
         db.add(p)
     db.add(models.ImportLog(
-        filename=f"[остатки товаров] {filename}", user_id=user_id,
+        filename=f"[остатки товаров{note}] {filename}", user_id=user_id,
         added=len(parsed), skipped=0, errors_count=0,
     ))
     db.commit()
@@ -353,6 +369,7 @@ def import_stock_balances_workbook(
                       "Проверьте выгрузку в 1С (отчёт выгрузился пустым).",
         }
 
+    note = _shrink_note(db, org, len(parsed))
     db.query(models.StockBalance).filter(models.StockBalance.organization == org).delete()
     now = datetime.utcnow()
     for product, warehouse, amount, qty in parsed:
@@ -364,7 +381,7 @@ def import_stock_balances_workbook(
     added = len(parsed)
 
     db.add(models.ImportLog(
-        filename=f"[остатки товаров] {filename}", user_id=user_id,
+        filename=f"[остатки товаров{note}] {filename}", user_id=user_id,
         added=added, skipped=0, errors_count=0,
     ))
     db.commit()

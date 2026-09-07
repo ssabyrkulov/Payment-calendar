@@ -550,10 +550,28 @@ async def inbox(
     file_hash = hashlib.sha256(content).hexdigest()
 
     auto_name = f"[авто:{org}] {filename}"
+
+    def log_failure(reason: str) -> None:
+        """Отказ импорта — в журнал загрузок, а не только в ответ скрипту.
+
+        Ответ уходит в лог Apps Script, куда никто не смотрит, и в портале
+        отказавшая загрузка выглядела как «файл не приходил вовсе». Отличить
+        «не доехал» от «доехал и не разобрался» было невозможно, а лечатся
+        они по-разному. Пишем отдельной транзакцией: прежняя уже откачена."""
+        try:
+            db.rollback()
+            db.add(models.ImportLog(
+                filename=f"[ошибка:{kind}] {filename} — {reason[:400]}",
+                user_id=robot.id, added=0, skipped=0, errors_count=1))
+            db.commit()
+        except Exception:  # noqa: BLE001 — журнал не должен маскировать сбой
+            db.rollback()
+
     try:
         return _dispatch_import(db, kind, content, auto_name, robot, filename,
                                 org, file_hash)
-    except HTTPException:
+    except HTTPException as err:
+        log_failure(str(getattr(err, "detail", err)))
         raise
     except Exception as err:  # noqa: BLE001 — важно назвать место сбоя
         # Ответ уходит в журнал Apps Script, а туда traceback целиком не
@@ -565,11 +583,10 @@ async def inbox(
         where = (f"{last.filename.split('/')[-1]}:{last.lineno} в {last.name}()"
                  if last else "неизвестно")
         db.rollback()
-        raise HTTPException(
-            status_code=400,
-            detail=f"Не удалось загрузить «{filename}» ({kind}): "
-                   f"{type(err).__name__}: {err} — {where}",
-        ) from err
+        detail = (f"Не удалось загрузить «{filename}» ({kind}): "
+                  f"{type(err).__name__}: {err} — {where}")
+        log_failure(detail)
+        raise HTTPException(status_code=400, detail=detail) from err
 
 
 def _dispatch_import(db, kind, content, auto_name, robot, filename, org, file_hash):
