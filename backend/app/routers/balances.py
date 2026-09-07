@@ -543,6 +543,24 @@ def stock_sources(
     except Exception:  # noqa: BLE001 — зеркало не должно ронять карточку
         synced = None
 
+    # Когда снапшота нет, колонка молча исчезала — и это выглядело как поломка
+    # портала, хотя означает ровно одно: остатки не загрузились. Достаём из
+    # журнала, когда файл приходил последний раз и не был ли он пустым, чтобы
+    # сказать это словами вместо пропавшего столбца.
+    last_import = None
+    if not upr_rows:
+        log = (db.query(models.ImportLog)
+               .filter(models.ImportLog.filename.like("%[остатки товаров%"))
+               .order_by(models.ImportLog.created_at.desc())
+               .first())
+        if log is not None:
+            last_import = {
+                "at": log.created_at.isoformat(),
+                "file": log.filename.split("] ")[-1],
+                "rows": log.added,
+                "empty": "пусто" in log.filename,
+            }
+
     return {
         "org": org,
         "sources": {
@@ -550,6 +568,8 @@ def stock_sources(
                 "label": "Управленка",
                 "note": "снапшот 1С",
                 "available": bool(upr_rows),
+                # Пусто — почему: когда приходил файл и сколько строк дал.
+                "last_import": last_import,
                 "total_qty": total("upr"),
                 "total_amount": round(sum(i["upr_amount"] or 0 for i in items), 2),
                 "updated_at": (upr_rows[0].updated_at.isoformat()

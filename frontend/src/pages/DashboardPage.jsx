@@ -249,9 +249,27 @@ function StockSourcesCard() {
         { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })
     : null)
 
+  // Источник без данных раньше просто исчезал столбцом, и это читалось как
+  // поломка портала. Говорим словами: колонки нет, потому что снапшот не
+  // загрузился, и вот когда файл приходил последний раз.
+  // Только про управленку: её источник — снапшот 1С, и его отсутствие
+  // означает сбой загрузки. Пустые налоговая и SalesDoc — нормальное
+  // состояние (движений нет, зеркало не настроено), про них молчим.
+  const gone = s.upr.available ? [] : ['upr']
+
   return (
     <div className="chart-card">
       <div className="sd-card-title">📦 Остатки на складах: три источника</div>
+      {gone.map((k) => (
+        <p key={k} className="sc-diff">
+          {s[k].label}: данных нет, колонка скрыта.
+          {s[k].last_import
+            ? ` Последняя загрузка остатков — ${when(s[k].last_import.at)}`
+              + `, файл «${s[k].last_import.file}», строк ${s[k].last_import.rows}`
+              + (s[k].last_import.empty ? ' (файл пришёл пустым).' : '.')
+            : ' Загрузок остатков в журнале нет.'}
+        </p>
+      ))}
       <div className="stock-src-tiles">
         {cols.map((k) => (
           <div key={k} className={`stock-src-tile src-${k}`}>
