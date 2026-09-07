@@ -1806,3 +1806,101 @@ def goods_flow(
         "kinds_with_diff": sum(1 for k in matched if abs(k["diff"]) >= min_diff),
         "positions_with_diff": sum(len(k["mismatch"]) for k in matched),
     }
+
+
+@router.get("/stock-calc")
+def tax_stock_calc(
+    db: Session = Depends(get_db),
+    _: models.User = Depends(get_current_user),
+    org: str = Query(default="all"),
+):
+    """Расчётные остатки налогового контура — та же раскладка, что у управленки.
+
+    Разница одна, и она принципиальная: у управленки есть отчёт 1С по
+    остаткам, и расчёт из движений можно сверить с фактом склада. В налоговом
+    пакете такого файла нет вовсе — сверять не с чем. Поэтому правая сторона
+    здесь не «остаток 1С», а остаток управленки: это единственная величина,
+    с которой налоговый расчёт осмысленно сравнивать.
+    """
+    from .purchases import _group_of, _norm_product, _size_of
+
+    o = models.normalize_org(org) if (org or "").lower() in models.ORGS else None
+
+    # Знак и колонка каждой строки таблицы.
+    COLS = {"purchase": "purchased", "stock_in": "received", "sale": "sold",
+            "return": "returned", "writeoff": "written_off",
+            "return_supplier": "returned_supplier"}
+    SIGN = {"purchased": 1, "received": 1, "returned": 1,
+            "sold": -1, "written_off": -1, "returned_supplier": -1}
+
+    rows: dict[str, dict] = {}
+
+    def cell(name: str | None) -> dict:
+        key = _norm_product(name)
+        e = rows.get(key)
+        if e is None:
+            e = rows[key] = {"product": name or "—", "upr": None,
+                             **{c: 0.0 for c in SIGN}}
+        return e
+
+    q = db.query(models.TaxOperation.kind, models.TaxOperation.product,
+                 models.TaxOperation.qty, models.TaxOperation.account,
+                 models.TaxOperation.source)
+    if o:
+        q = q.filter(models.TaxOperation.organization == o)
+    for kind, product, qty, account, source in q.filter(
+            models.TaxOperation.kind.in_(tuple(COLS))).all():
+        if not product:
+            continue
+        src = (source or "").lower()
+        if "услуг" in src or "доп расход" in src:
+            continue
+        if not _goods_account_ok(account):
+            continue
+        cell(product)[COLS[kind]] += float(qty or 0)
+
+    # Правая сторона: снапшот остатков управленки. Название берём из него —
+    # в налоговой те же позиции зовутся «Детские подгузники…», и таблица
+    # читалась бы двумя разными словарями.
+    upr_at = None
+    for r in models.org_scope(db.query(models.StockBalance),
+                              models.StockBalance, org).all():
+        e = cell(r.product)
+        e["product"] = r.product
+        e["upr"] = (e["upr"] or 0.0) + float(r.qty or 0)
+        if upr_at is None or (r.updated_at and r.updated_at > upr_at):
+            upr_at = r.updated_at
+
+    out = []
+    for e in rows.values():
+        calc = sum(SIGN[c] * e[c] for c in SIGN)
+        if abs(calc) < 0.001 and not any(abs(e[c]) >= 0.001 for c in SIGN) \
+                and not e["upr"]:
+            continue
+        out.append({
+            "product": e["product"],
+            **{c: round(e[c], 1) for c in SIGN},
+            "calc_qty": round(calc, 1),
+            "upr_qty": None if e["upr"] is None else round(e["upr"], 1),
+            "diff_upr": (None if e["upr"] is None
+                         else round(calc - e["upr"], 1)),
+        })
+    out.sort(key=lambda x: (_group_of(x["product"]), _size_of(x["product"]),
+                            x["product"] or ""))
+
+    def total(field: str) -> float:
+        return round(sum(r[field] or 0 for r in out), 1)
+
+    return {
+        "org": o or "all",
+        "rows": out,
+        "totals": {**{c: total(c) for c in SIGN},
+                   "calc_qty": total("calc_qty"), "upr_qty": total("upr_qty")},
+        # Снапшота остатков в налоговом пакете 1С нет — говорим прямо, чтобы
+        # пустая колонка не выглядела недоработкой портала.
+        "has_snapshot": False,
+        "upr_at": upr_at.isoformat() if upr_at else None,
+        "positions_with_diff": sum(1 for r in out
+                                   if r["diff_upr"] is not None
+                                   and abs(r["diff_upr"]) >= 0.5),
+    }

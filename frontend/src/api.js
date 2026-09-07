@@ -114,6 +114,8 @@ export const api = {
     const q = new URLSearchParams(params).toString()
     return request(`/tax/goods-flow${q ? '?' + q : ''}`)
   },
+  // Расчётные остатки налогового контура: та же раскладка движений.
+  taxStockCalc: () => request('/tax/stock-calc'),
   taxUnposted: () => request('/tax/unposted'),
   contourEvents: (state = 'open') => request(`/tax/contour-events?state=${state}`),
   contourEventsScan: () => request('/tax/contour-events/scan', { method: 'POST' }),

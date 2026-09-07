@@ -219,6 +219,7 @@ export default function DashboardPage() {
       <ContourGoodsCard />
       <StockSourcesCard />
       <CalcStockCard />
+      <TaxStockCalcCard />
     </>
   )
 }
@@ -993,6 +994,114 @@ function ContourGoodsCard() {
         стороны исключены услуги, доп. расходы (те же товары второй раз, ради
         разнесения таможни) и нетоварные счета — бензин и мебель приходуются
         тем же документом, что подгузники.
+      </p>
+    </div>
+  )
+}
+
+
+// Та же раскладка движений, что у управленки, но по налоговому контуру.
+// Правая сторона другая по необходимости: отчёта об остатках в налоговом
+// пакете 1С нет вовсе, поэтому расчёт сравнивается с остатком управленки —
+// единственной величиной, с которой его осмысленно сравнивать.
+function TaxStockCalcCard() {
+  const [data, setData] = useState(null)
+  const [error, setError] = useState(null)
+  const [showAll, setShowAll] = useState(false)
+
+  useEffect(() => {
+    api.taxStockCalc().then(setData).catch((e) => setError(e.message))
+  }, [])
+
+  if (error || !data || !data.rows.length) return null
+  const rows = showAll || data.rows.length <= 25
+    ? data.rows : data.rows.slice(0, 25)
+  const fmt = (v) => (v == null || v === 0 ? '—'
+    : Number(v).toLocaleString('ru-RU', { maximumFractionDigits: 1 }))
+  const num = (v) => (v == null ? '—'
+    : Number(v).toLocaleString('ru-RU', { maximumFractionDigits: 1 }))
+  const t = data.totals
+
+  return (
+    <div className="chart-card">
+      <div className="sd-card-title">
+        🧾 Остатки товаров в налоговой: расчёт из движений
+      </div>
+      <p className="muted">
+        Слева движения налогового контура, справа остаток управленки. Отчёта
+        об остатках в налоговом пакете 1С нет вовсе, поэтому сверять расчёт
+        не с чем — сравниваем с управленческим складом.
+        {data.positions_with_diff > 0
+          ? ` Расходится позиций: ${data.positions_with_diff}.` : ''}
+      </p>
+      <div className="table-wrap rc-table">
+        <table>
+          <thead>
+            <tr>
+              <th>Номенклатура</th>
+              <th className="num">Поступило</th>
+              <th className="num">Оприход.</th>
+              <th className="num">Продано</th>
+              <th className="num">Возвраты</th>
+              <th className="num">Списано</th>
+              <th className="num">Возвр. поставщику</th>
+              <th className="num">Расчётный остаток</th>
+              <th className="num">Остаток управленки</th>
+              <th className="num">Δ</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r, i) => (
+              <tr key={i}>
+                <td>{r.product}</td>
+                <td className="num">{fmt(r.purchased)}</td>
+                <td className="num">{fmt(r.received)}</td>
+                <td className="num">{fmt(r.sold)}</td>
+                <td className="num">{fmt(r.returned)}</td>
+                <td className="num">{r.written_off ? `−${num(r.written_off)}` : '—'}</td>
+                <td className="num">
+                  {r.returned_supplier ? `−${num(r.returned_supplier)}` : '—'}
+                </td>
+                <td className={`num ${r.calc_qty < 0 ? 'sc-diff' : ''}`}>
+                  <b>{num(r.calc_qty)}</b>
+                </td>
+                <td className="num">{r.upr_qty == null ? '—' : num(r.upr_qty)}</td>
+                <td className={`num ${r.diff_upr ? 'sc-diff' : ''}`}>
+                  {r.diff_upr == null ? '—' : num(r.diff_upr)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+          <tfoot>
+            <tr>
+              <td><b>Итого</b></td>
+              <td className="num"><b>{num(t.purchased)}</b></td>
+              <td className="num"><b>{fmt(t.received)}</b></td>
+              <td className="num"><b>{num(t.sold)}</b></td>
+              <td className="num"><b>{num(t.returned)}</b></td>
+              <td className="num">
+                <b>{t.written_off ? `−${num(t.written_off)}` : '—'}</b>
+              </td>
+              <td className="num">
+                <b>{t.returned_supplier ? `−${num(t.returned_supplier)}` : '—'}</b>
+              </td>
+              <td className="num"><b>{num(t.calc_qty)}</b></td>
+              <td className="num"><b>{num(t.upr_qty)}</b></td>
+              <td className="num"><b>{num(t.calc_qty - t.upr_qty)}</b></td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+      {data.rows.length > 25 && (
+        <button className="btn btn-ghost btn-sm" onClick={() => setShowAll(!showAll)}>
+          {showAll ? 'Свернуть' : `Показать все ${data.rows.length}`}
+        </button>
+      )}
+      <p className="muted">
+        Из налоговой стороны исключены услуги, доп. расходы (те же товары
+        второй раз, ради разнесения таможни) и нетоварные счета: бензин и
+        мебель приходуются тем же документом, что подгузники. Перемещения не
+        в счёт — они двигают товар между своими складами.
       </p>
     </div>
   )
