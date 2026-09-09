@@ -169,8 +169,13 @@ function isExcel(f) {
 // связи и ответы 5xx (сервис поднимается). Ошибку самого портала — 400 «не
 // тот формат», 401 «неверный токен» — повторять бессмысленно, она от паузы
 // не изменится, а прогон затянется втрое.
+//
+// Паузы короткие нарочно: у Apps Script на весь прогон шесть минут, и
+// длинные ожидания на каждом файле их съедят. Перезапуск портала длится
+// дольше этих пауз, поэтому файлы, упавшие с 5xx, добираются вторым
+// проходом в конце прогона — см. syncNewFiles.
 function fetchWithRetry(options) {
-  const DELAYS = [2000, 5000];  // третья попытка идёт сразу после второй паузы
+  const DELAYS = [3000, 8000];  // третья попытка идёт сразу после второй паузы
   let lastError = null;
   for (let attempt = 0; attempt <= DELAYS.length; attempt++) {
     if (attempt > 0) Utilities.sleep(DELAYS[attempt - 1]);
@@ -190,10 +195,44 @@ function fetchWithRetry(options) {
   throw new Error('после 3 попыток: ' + lastError);
 }
 
+// Дождаться, пока портал снова отвечает. Проверка по /healthz — она не
+// трогает базу и отвечает мгновенно, как только сервис поднялся. Ждём не
+// дольше полутора минут: столько занимает перезапуск на Render с запасом.
+function waitForPortal() {
+  const health = ENDPOINT.replace(/\/integrations\/inbox.*$/, '/healthz');
+  for (let i = 0; i < 9; i++) {
+    try {
+      const code = UrlFetchApp.fetch(health, { muteHttpExceptions: true })
+                              .getResponseCode();
+      if (code === 200) return true;
+    } catch (e) { /* ещё лежит */ }
+    Utilities.sleep(10000);
+  }
+  return false;
+}
+
+// Один файл — одна отправка. Возвращает ответ портала; бросает исключение,
+// если портал так и не ответил (5xx или обрыв связи после всех попыток).
+function sendFile(folder, name) {
+  const found = DriveApp.getFolderById(folder.id).getFilesByName(name);
+  if (!found.hasNext()) throw new Error('исчез из папки');
+  const f = found.next();
+  return fetchWithRetry({
+    method: 'post',
+    headers: { Authorization: 'Bearer ' + TOKEN },
+    // fname — имя файла отдельным полем (кириллица в заголовке multipart
+    // портится); org — фирма; ledger — контур (управленка/налоговая).
+    payload: { file: f.getBlob(), fname: name, org: folder.org,
+               ledger: folder.ledger || 'upr' },
+    muteHttpExceptions: true,
+  });
+}
+
 function syncNewFiles() {
   const props = PropertiesService.getScriptProperties();
   let seen = 0, sent = 0, known = 0, failed = 0;
   const notSent = [];
+  const retryLater = [];  // упали на лежащем портале — дошлём в конце
 
   FOLDERS.forEach(function (folder) {
     // Имена собираем заранее, а сам файл берём по имени прямо перед
@@ -221,19 +260,12 @@ function syncNewFiles() {
 
       try {
         // Портал живёт на Render, а тот перезапускает сервис на каждом
-        // деплое. Файлы уходят по одному, прогон идёт минутами, и в окно
-        // перезапуска попадает случайная горстка: раньше они просто падали
-        // с «Address unavailable» и ждали следующего часа. Три попытки с
-        // нарастающей паузой закрывают перезапуск целиком.
-        const res = fetchWithRetry({
-          method: 'post',
-          headers: { Authorization: 'Bearer ' + TOKEN },
-          // fname — имя файла отдельным полем (кириллица в заголовке multipart
-          // портится); org — фирма; ledger — контур (управленка/налоговая).
-          payload: { file: f.getBlob(), fname: name, org: folder.org,
-                     ledger: folder.ledger || 'upr' },
-          muteHttpExceptions: true,
-        });
+        // деплое и после нехватки памяти. Файлы уходят по одному, прогон
+        // идёт минутами, и в окно перезапуска попадает горстка подряд:
+        // раньше они падали с «Address unavailable» или HTTP 502 и ждали
+        // следующего часа. Короткие повторы закрывают мелкие обрывы, а
+        // упавшие насовсем откладываются на второй проход.
+        const res = sendFile(folder, name);
         const code = res.getResponseCode();
         if (code === 200) {
           props.setProperty(key, mod); // запомнили — файл доставлен
@@ -246,12 +278,43 @@ function syncNewFiles() {
           // не помечаем как отправленный — попробуем в следующий запуск
         }
       } catch (e) {
-        failed++;
-        notSent.push(name + ' — ' + e);
-        console.error(tag + name + ' -> ' + e);
+        // Сюда попадает только то, что лечится ожиданием: портал не
+        // ответил после всех попыток. Ответ 4xx сюда не доходит.
+        retryLater.push({ folder: folder, name: name, key: key, mod: mod,
+                          tag: tag, error: String(e) });
+        console.warn(tag + name + ' -> ' + e + ', отложен на второй проход');
       }
     });
   });
+
+  // Второй проход: файлы, на которых портал лежал. Ждём, пока он снова
+  // отвечает, и отправляем каждый ещё раз. Без этого прохода при каждом
+  // перезапуске сервиса терялась пачка из пяти-семи файлов подряд, и час
+  // на портале жили несвежие остатки, контрагенты и касса.
+  if (retryLater.length) {
+    console.log('Второй проход: ' + retryLater.length + ' файл(ов), жду портал…');
+    const alive = waitForPortal();
+    if (!alive) console.warn('Портал не поднялся за полторы минуты, пробую всё равно');
+    retryLater.forEach(function (r) {
+      try {
+        const res = sendFile(r.folder, r.name);
+        const code = res.getResponseCode();
+        if (code === 200) {
+          props.setProperty(r.key, r.mod);
+          sent++;
+          console.log(r.tag + r.name + ' -> ' + res.getContentText() + ' (со второго прохода)');
+        } else {
+          failed++;
+          notSent.push(r.name + ' — HTTP ' + code);
+          console.warn(r.tag + r.name + ' -> HTTP ' + code + ': ' + res.getContentText());
+        }
+      } catch (e) {
+        failed++;
+        notSent.push(r.name + ' — ' + e);
+        console.error(r.tag + r.name + ' -> ' + e);
+      }
+    });
+  }
 
   // Итог прогона. Без него понять, что часть файлов не доехала, можно было
   // только вручную сверив список лога со списком папки.

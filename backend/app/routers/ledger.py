@@ -46,19 +46,30 @@ def import_ledger_workbook(db: Session, content: bytes, filename: str,
     from .tax import _day, _num
 
     org = models.normalize_org(org)
+    # Журнал — самый большой файл выгрузки (у Хайджина полтора мегабайта,
+    # двадцать тысяч строк). Раньше он читался в память целиком, потом из
+    # него строился список объектов, и только затем шла запись; на плане
+    # Starter с одним процессом этот пик выбивал сервис, и соседние файлы
+    # автосинка ловили 502, пока Render его поднимал. Теперь файл идёт
+    # потоком: строка прочитана — сложена в словарь — порция ушла в базу.
+    # В памяти одновременно живёт одна порция, а не весь журнал.
     wb = xlsx.load_workbook(content)
     ws = wb[wb.sheetnames[0]]
-    rows = [list(r) for r in ws.iter_rows(values_only=True)]
+    stream = ws.iter_rows(values_only=True)
 
-    header_idx, col = None, {}
-    for i, row in enumerate(rows[:10]):
+    col, first_row = {}, None
+    for i, row in enumerate(stream):
+        if first_row is None:
+            first_row = row
         names = {str(c).strip(): j for j, c in enumerate(row) if c}
         if "Период" in names and "СчетДт" in names and "СчетКт" in names:
-            header_idx = i
             col = {HEADERS[k]: j for k, j in names.items() if k in HEADERS}
             break
-    if header_idx is None:
-        found = ", ".join(str(c).strip() for c in (rows[0] if rows else [])
+        if i >= 9:
+            break
+    if not col:
+        wb.close()
+        found = ", ".join(str(c).strip() for c in (first_row or ())
                           if c is not None)[:300]
         raise HTTPException(
             status_code=400,
@@ -72,16 +83,33 @@ def import_ledger_workbook(db: Session, content: bytes, filename: str,
     def text(row, key):
         return str(cell(row, key) or "").strip() or None
 
-    parsed: list[models.LedgerEntry] = []
-    inactive = 0
-    for row in rows[header_idx + 1:]:
+    CHUNK = 2000
+    chunk: list[dict] = []
+    added = inactive = 0
+    replaced = False
+
+    def write(batch):
+        nonlocal replaced
+        if not replaced:
+            # Старые проводки убираем перед первой порцией, а не после
+            # разбора всего файла: так не нужно держать файл целиком. Это
+            # одна транзакция с записью — если файл оборвётся посередине,
+            # откат вернёт прежний журнал.
+            db.query(models.LedgerEntry).filter(
+                models.LedgerEntry.organization == org
+            ).delete(synchronize_session=False)
+            replaced = True
+        db.bulk_insert_mappings(models.LedgerEntry, batch)
+        db.flush()
+
+    for row in stream:
         d = _day(cell(row, "date"))
         if d is None:
             continue  # пустой хвост файла или итоговая строка
         if str(cell(row, "active") or "").strip().lower() in ("нет", "false"):
             inactive += 1
             continue
-        parsed.append(models.LedgerEntry(
+        chunk.append(dict(
             organization=org,
             date=d,
             doc=text(row, "doc"),
@@ -96,26 +124,23 @@ def import_ledger_workbook(db: Session, content: bytes, filename: str,
             amount=_num(cell(row, "amount")),
             content=text(row, "content"),
         ))
-    if not parsed:
+        added += 1
+        if len(chunk) >= CHUNK:
+            write(chunk)
+            chunk = []
+    wb.close()
+    if chunk:
+        write(chunk)
+    if not added:
         # Пустой журнал не бывает у живой базы — сбой выгрузки, прежние
         # данные не трогаем.
         return {"added": 0, "skipped_inactive": inactive, "empty": True}
 
-    db.query(models.LedgerEntry).filter(
-        models.LedgerEntry.organization == org).delete(synchronize_session=False)
-    # Журнал — самый большой файл выгрузки (у Хайджина ~20 тыс. строк).
-    # Пишем порциями: разовый bulk на весь список держит все объекты в
-    # памяти одновременно, и на маленьком инстансе Render этот пик ронял
-    # сервис — соседние запросы автосинка ловили 502.
-    CHUNK = 2000
-    for i in range(0, len(parsed), CHUNK):
-        db.bulk_save_objects(parsed[i:i + CHUNK])
-        db.flush()
     db.add(models.ImportLog(filename=f"[проводки:{org}] {filename}",
-                            user_id=user_id, added=len(parsed),
+                            user_id=user_id, added=added,
                             skipped=inactive, errors_count=0))
     db.commit()
-    return {"added": len(parsed), "skipped_inactive": inactive}
+    return {"added": added, "skipped_inactive": inactive}
 
 
 @router.get("/accounts")
